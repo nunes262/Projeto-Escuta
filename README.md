@@ -9,18 +9,6 @@ Trabalho A3 · Usabilidade, Desenvolvimento Web, Mobile e Jogos
 
 Site publicado: _(colar o link do Firebase Hosting aqui)_
 
-## Equipe
-
-| Nome | RA | Papel |
-| ---- | -- | ----- |
-|      |    | Coordenação e GitHub |
-|      |    | Front-end React |
-|      |    | Front-end React |
-|      |    | Firebase e segurança |
-|      |    | UX e protótipo |
-|      |    | Pesquisa e documentação |
-|      |    | Pitch e apresentação |
-
 ## Tecnologias
 
 React 19 + Vite · React Router · Firebase (Authentication, Cloud Firestore + Security Rules,
