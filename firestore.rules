@@ -1,0 +1,232 @@
+// firestore.rules
+// Publicar: npx firebase-tools deploy --only firestore:rules
+// (ou colar em Console do Firebase > Firestore Database > Regras > Publicar)
+//
+// Estas regras são o que garante o anonimato e a integridade dos dados.
+// Elas rodam no servidor do Google e valem mesmo que alguém altere o site.
+// Categorias, status e setores precisam bater com src/constantes.js.
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function ehOuvidor() {
+      return request.auth != null
+        && exists(/databases/$(database)/documents/ouvidores/$(request.auth.uid));
+    }
+
+    function textoAte(valor, maximo) {
+      return valor is string && valor.size() <= maximo;
+    }
+
+    function textoEntre(valor, minimo, maximo) {
+      return valor is string && valor.size() >= minimo && valor.size() <= maximo;
+    }
+
+    function categorias() {
+      return [
+        'Bullying ou cyberbullying',
+        'Assédio moral',
+        'Assédio sexual',
+        'Discriminação',
+        'Violência física',
+        'Irregularidade administrativa',
+        'Outro'
+      ];
+    }
+
+    function setores() {
+      return [
+        'Coordenação de curso',
+        'Diretoria acadêmica',
+        'Diretoria administrativa',
+        'Núcleo de apoio psicopedagógico',
+        'Recursos humanos',
+        'Segurança do campus'
+      ];
+    }
+
+    function statusValidos() {
+      return ['recebida', 'em_analise', 'encaminhada', 'concluida', 'arquivada'];
+    }
+
+    function statusFinais() {
+      return ['concluida', 'arquivada'];
+    }
+
+    match /denuncias/{codigo} {
+
+      function contador() {
+        return /databases/$(database)/documents/contadores/denuncias;
+      }
+
+      // O protocolo tem que usar o número que o contador acabou de receber,
+      // na mesma transação. Ninguém escolhe o próprio protocolo.
+      function protocoloBate(protocolo) {
+        let antes = exists(contador()) ? get(contador()).data.valor : 0;
+        let depois = getAfter(contador()).data.valor;
+        return protocolo is string
+          && protocolo.matches('^ESC-[0-9]{4}-[0-9]{4,}$')
+          && depois == antes + 1
+          && int(protocolo.split('-')[2]) == depois;
+      }
+
+      function novaDenunciaValida() {
+        let d = request.resource.data;
+        let campos = ['categoria', 'local', 'quando', 'descricao', 'riscoImediato',
+          'protocolo', 'status', 'historico', 'prazo', 'prorrogado', 'setor',
+          'mensagemNova', 'criadoEm'];
+        return codigo.matches('^[2-9A-HJKMNP-Z]{16}$')
+          && d.keys().hasOnly(campos)
+          && d.keys().hasAll(campos)
+          && d.categoria in categorias()
+          && textoAte(d.local, 200)
+          && textoAte(d.quando, 200)
+          && textoEntre(d.descricao, 20, 5000)
+          && d.riscoImediato is bool
+          && d.status == 'recebida'
+          && d.historico is list
+          && d.historico.size() == 1
+          && d.historico[0].keys().hasOnly(['status', 'em', 'observacao'])
+          && d.historico[0].status == 'recebida'
+          && d.historico[0].observacao == ''
+          && d.historico[0].em is timestamp
+          && d.historico[0].em > request.time - duration.value(1, 'd')
+          && d.historico[0].em < request.time + duration.value(1, 'd')
+          && d.prazo is timestamp
+          && d.prazo > request.time + duration.value(29, 'd')
+          && d.prazo < request.time + duration.value(31, 'd')
+          && d.prorrogado == false
+          && d.setor == ''
+          && d.mensagemNova == false
+          && d.criadoEm == request.time
+          && protocoloBate(d.protocolo);
+      }
+
+      // Cada mudança de status acrescenta uma linha ao histórico, sem apagar as anteriores.
+      function historicoValido(antes, depois) {
+        let n = antes.historico.size();
+        let ultima = depois.historico[n];
+        return depois.historico.size() == n + 1
+          && depois.historico[0:n] == antes.historico
+          && ultima.keys().hasOnly(['status', 'em', 'observacao'])
+          && ultima.status == depois.status
+          && ultima.em is timestamp
+          && textoAte(ultima.observacao, 2000)
+          // Concluir ou arquivar exige uma resposta escrita, que o denunciante vê
+          && (!(depois.status in statusFinais()) || ultima.observacao.size() >= 10)
+          && (depois.status != 'encaminhada' || depois.setor != '');
+      }
+
+      // Lei 13.460/2017: prorrogação única, por mais 30 dias, com justificativa
+      function prorrogacaoValida(antes, depois) {
+        return antes.prorrogado == false
+          && !(antes.status in statusFinais())
+          && depois.prorrogado == true
+          && depois.prazo == antes.prazo + duration.value(30, 'd')
+          && textoEntre(depois.justificativaProrrogacao, 10, 2000)
+          && depois.prorrogadoEm == request.time;
+      }
+
+      function atualizacaoDaOuvidoria() {
+        let antes = resource.data;
+        let depois = request.resource.data;
+        let mudou = depois.diff(antes).affectedKeys();
+        return ehOuvidor()
+          && mudou.hasOnly(['status', 'historico', 'setor', 'mensagemNova', 'prazo',
+            'prorrogado', 'justificativaProrrogacao', 'prorrogadoEm'])
+          && depois.status in statusValidos()
+          && depois.mensagemNova is bool
+          && (depois.setor == '' || depois.setor in setores())
+          && (!mudou.hasAny(['status']) || mudou.hasAny(['historico']))
+          && (!mudou.hasAny(['historico']) || historicoValido(antes, depois))
+          && (!mudou.hasAny(['prazo', 'prorrogado', 'justificativaProrrogacao', 'prorrogadoEm'])
+            || prorrogacaoValida(antes, depois));
+      }
+
+      // O denunciante (sem login) só pode ligar o aviso de "mensagem nova"
+      function avisoDeMensagem() {
+        return request.auth == null
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['mensagemNova'])
+          && request.resource.data.mensagemNova == true
+          && !(resource.data.status in statusFinais());
+      }
+
+      // Qualquer pessoa denuncia, sem login. Toda denúncia nasce "recebida".
+      allow create: if novaDenunciaValida();
+
+      // get = abrir UMA denúncia sabendo o código (que é o ID)
+      allow get: if true;
+
+      // list = ver todas de uma vez. Só a ouvidoria.
+      allow list: if ehOuvidor();
+
+      allow update: if atualizacaoDaOuvidoria() || avisoDeMensagem();
+
+      // Ninguém apaga denúncias pelo site
+      allow delete: if false;
+
+      match /mensagens/{mensagem} {
+        function denuncia() {
+          return /databases/$(database)/documents/denuncias/$(codigo);
+        }
+
+        function mensagemValida() {
+          let m = request.resource.data;
+          return m.keys().hasOnly(['texto', 'autor', 'enviadaEm'])
+            && m.keys().hasAll(['texto', 'autor', 'enviadaEm'])
+            && textoEntre(m.texto, 1, 2000)
+            && m.enviadaEm == request.time
+            && exists(denuncia());
+        }
+
+        // Só chega aqui quem já sabe o código da denúncia
+        allow read: if true;
+
+        // Denunciante escreve sem login (e ninguém logado se passa por ele);
+        // a ouvidoria escreve logada. Denúncia encerrada não recebe mensagens.
+        allow create: if mensagemValida() && (
+          (request.resource.data.autor == 'denunciante'
+            && request.auth == null
+            && !(get(denuncia()).data.status in statusFinais()))
+          || (request.resource.data.autor == 'ouvidoria' && ehOuvidor())
+        );
+      }
+    }
+
+    match /contadores/denuncias {
+      allow read: if true;
+      // O número do protocolo só pode subir de 1 em 1
+      allow create: if request.resource.data.keys().hasOnly(['valor'])
+        && request.resource.data.valor == 1;
+      allow update: if request.resource.data.keys().hasOnly(['valor'])
+        && request.resource.data.valor == resource.data.valor + 1;
+    }
+
+    match /estatisticas/{documento} {
+      allow read: if true;
+      // Só números: nenhum campo de texto livre chega ao painel público
+      allow write: if ehOuvidor()
+        && request.resource.data.keys().hasOnly(['ano', 'total', 'concluidas', 'arquivadas',
+          'emAndamento', 'respondidas', 'noPrazo', 'percentualNoPrazo', 'tempoMedioDias',
+          'porMes', 'porCategoria', 'atualizadoEm'])
+        && request.resource.data.total is int
+        && request.resource.data.atualizadoEm == request.time;
+    }
+
+    // "O que mudou a partir das denúncias", no painel de transparência
+    match /mudancas/{id} {
+      allow read: if true;
+      allow create: if ehOuvidor()
+        && request.resource.data.keys().hasOnly(['mes', 'texto', 'criadoEm'])
+        && request.resource.data.mes is string
+        && request.resource.data.mes.matches('^[0-9]{4}-[0-9]{2}$')
+        && textoEntre(request.resource.data.texto, 10, 280)
+        && request.resource.data.criadoEm == request.time;
+      allow delete: if ehOuvidor();
+    }
+
+    match /ouvidores/{uid} {
+      allow read: if request.auth != null && request.auth.uid == uid;
+    }
+  }
+}
